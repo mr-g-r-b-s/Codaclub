@@ -4,20 +4,18 @@ const app     = express();
 const http    = require('http').createServer(app);
 const io      = require('socket.io')(http, { cors: { origin: "*" } });
 
-// ── Supabase ─────────────────────────────────────────────────
-// npm install @supabase/supabase-js
 const { createClient } = require('@supabase/supabase-js');
+const supabase = createClient(
+  process.env.SUPABASE_URL     || 'https://YOUR_PROJECT.supabase.co',
+  process.env.SUPABASE_ANON_KEY || 'YOUR_SERVICE_ROLE_KEY'
+);
 
-const SUPABASE_URL      = process.env.SUPABASE_URL      || 'https://YOUR_PROJECT.supabase.co';
-const SUPABASE_ANON_KEY = process.env.SUPABASE_ANON_KEY || 'YOUR_SERVICE_ROLE_KEY'; // use service role key for writes
-const supabase          = createClient(SUPABASE_URL, SUPABASE_ANON_KEY);
-
-// ── Room store ───────────────────────────────────────────────
 const rooms = {};
 
 const ALL_CHALLENGE_IDS = [1,2,3,4,5,6,7,8,9,10,11,12];
 const ALL_LANGUAGES     = ['javascript','python','java','cpp','sql'];
 const SEQUENCE_LENGTH   = 12;
+const MATCH_DURATION    = 5 * 60; // seconds
 
 function buildRoundSequence() {
   const shuffled = [...ALL_CHALLENGE_IDS].sort(() => Math.random() - 0.5);
@@ -27,46 +25,49 @@ function buildRoundSequence() {
   }));
 }
 
-// ── Supabase helpers ─────────────────────────────────────────
-
-// Save match result for one player via the upsert function
-async function savePlayerResult({ name, won, points, rounds, bestMs }) {
-  try {
-    const { error } = await supabase.rpc('upsert_match_result', {
-      p_name:    name.toLowerCase(),
-      p_won:     won,
-      p_points:  points,
-      p_rounds:  rounds,
-      p_best_ms: bestMs ?? null,
-    });
-    if (error) console.error('Supabase save error:', error.message);
-    else console.log(`Saved stats for ${name}: won=${won}, pts=${points}, rounds=${rounds}`);
-  } catch (err) {
-    console.error('Supabase exception:', err.message);
-  }
-}
-
-// Save both players' results after a match concludes
-async function saveMatchResults(room, winnerSocketId, winnerPoints) {
+// ── Supabase: save both players' stats after a match ─────────
+async function saveMatchResults({ room, winnerSocketId, isDraw, matchDurationS }) {
   if (!room || room.players.length < 2) return;
 
-  for (let i = 0; i < room.players.length; i++) {
-    const socketId = room.players[i];
-    const name     = room.playerNames[i] || `Player${i + 1}`;
-    const won      = socketId === winnerSocketId;
-    const stats    = room.playerStats?.[socketId] || {};
+  // Only save if BOTH players are logged in (not guests)
+  const p0 = room.playerMeta[room.players[0]];
+  const p1 = room.playerMeta[room.players[1]];
+  if (!p0?.isLoggedIn || !p1?.isLoggedIn) {
+    console.log('Guest in match — stats not saved');
+    return;
+  }
 
-    await savePlayerResult({
-      name,
-      won,
-      points:  won ? winnerPoints : (stats.points || 0),
-      rounds:  stats.roundsSolved || 0,
-      bestMs:  stats.bestRoundMs  || null,
-    });
+  for (let i = 0; i < 2; i++) {
+    const socketId = room.players[i];
+    const oppIdx   = i === 0 ? 1 : 0;
+    const meta     = room.playerMeta[socketId];
+    const oppMeta  = room.playerMeta[room.players[oppIdx]];
+    const stats    = room.playerStats[socketId] || {};
+    const oppStats = room.playerStats[room.players[oppIdx]] || {};
+
+    const won = !isDraw && socketId === winnerSocketId;
+
+    try {
+      const { error } = await supabase.rpc('upsert_match_result', {
+        p_username:   meta.username.toLowerCase(),
+        p_opponent:   oppMeta.username.toLowerCase(),
+        p_won:        won,
+        p_draw:       isDraw,
+        p_points:     stats.points      || 0,
+        p_opp_points: oppStats.points   || 0,
+        p_rounds:     stats.roundsSolved || 0,
+        p_best_ms:    stats.bestRoundMs  || null,
+        p_duration_s: matchDurationS    || 0,
+      });
+      if (error) console.error(`Supabase error for ${meta.username}:`, error.message);
+      else console.log(`Saved stats: ${meta.username} — won=${won}, pts=${stats.points}`);
+    } catch (err) {
+      console.error('Supabase exception:', err.message);
+    }
   }
 }
 
-// ── Leaderboard fetch (called by client via socket) ───────────
+// ── Leaderboard fetch ─────────────────────────────────────────
 async function fetchLeaderboard(sortBy = 'wins') {
   const validSorts = {
     wins:         'wins',
@@ -75,31 +76,43 @@ async function fetchLeaderboard(sortBy = 'wins') {
     rounds:       'rounds_solved',
   };
   const col = validSorts[sortBy] || 'wins';
-
   const { data, error } = await supabase
     .from('players')
-    .select('name, wins, losses, total_points, rounds_solved, best_round_ms, current_streak, max_streak, last_played')
+    .select('username, wins, losses, total_points, rounds_solved, best_round_ms, current_streak, max_streak, last_played')
     .order(col, { ascending: false })
     .limit(10);
-
   if (error) { console.error('Leaderboard fetch error:', error.message); return []; }
   return data || [];
 }
 
-// ── Socket.io ─────────────────────────────────────────────────
+// ── Match history fetch ───────────────────────────────────────
+async function fetchMatchHistory(username) {
+  const { data, error } = await supabase
+    .from('match_history')
+    .select('opponent, result, my_points, opp_points, rounds_solved, duration_s, played_at')
+    .eq('username', username.toLowerCase())
+    .order('played_at', { ascending: false })
+    .limit(10);
+  if (error) { console.error('History fetch error:', error.message); return []; }
+  return data || [];
+}
+
+// ─────────────────────────────────────────────────────────────
 io.on('connection', (socket) => {
   console.log('connected:', socket.id);
 
-  // ── CREATE ROOM ────────────────────────────────────────────
-  socket.on('create-room', ({ roomCode, playerName }) => {
+  // ── CREATE ROOM ──────────────────────────────────────────────
+  socket.on('create-room', ({ roomCode, playerName, isLoggedIn, username }) => {
     if (rooms[roomCode]) { socket.emit('room-error', { message: 'Room already exists.' }); return; }
     rooms[roomCode] = {
-      players:      [socket.id],
-      playerNames:  [playerName],
-      spectators:   [],
+      players:       [socket.id],
+      playerNames:   [playerName],
+      spectators:    [],
       roundSequence: buildRoundSequence(),
-      playerStats:  { [socket.id]: { points: 0, roundsSolved: 0, bestRoundMs: null } },
-      gameState:    null,
+      playerStats:   { [socket.id]: { points: 0, roundsSolved: 0, bestRoundMs: null } },
+      playerMeta:    { [socket.id]: { isLoggedIn: !!isLoggedIn, username: username || playerName } },
+      gameState:     null,
+      startedAt:     null,
     };
     socket.join(roomCode);
     socket.roomCode    = roomCode;
@@ -107,8 +120,8 @@ io.on('connection', (socket) => {
     console.log(`Room created: ${roomCode} by ${playerName}`);
   });
 
-  // ── JOIN ROOM ──────────────────────────────────────────────
-  socket.on('join-room', ({ roomCode, playerName }) => {
+  // ── JOIN ROOM ────────────────────────────────────────────────
+  socket.on('join-room', ({ roomCode, playerName, isLoggedIn, username }) => {
     const room = rooms[roomCode];
     if (!room)                  { socket.emit('room-error', { message: `Room "${roomCode}" not found.` }); return; }
     if (room.players.length>=2) { socket.emit('room-error', { message: 'Room is full!' }); return; }
@@ -116,6 +129,8 @@ io.on('connection', (socket) => {
     room.players.push(socket.id);
     room.playerNames.push(playerName);
     room.playerStats[socket.id] = { points: 0, roundsSolved: 0, bestRoundMs: null };
+    room.playerMeta[socket.id]  = { isLoggedIn: !!isLoggedIn, username: username || playerName };
+    room.startedAt = Date.now(); // match starts when 2nd player joins
     socket.join(roomCode);
     socket.roomCode    = roomCode;
     socket.isSpectator = false;
@@ -127,7 +142,7 @@ io.on('connection', (socket) => {
     });
   });
 
-  // ── SPECTATE ───────────────────────────────────────────────
+  // ── SPECTATE ─────────────────────────────────────────────────
   socket.on('spectate-room', ({ roomCode }) => {
     const room = rooms[roomCode];
     if (!room)                   { socket.emit('room-error', { message: `Room "${roomCode}" not found.` }); return; }
@@ -139,38 +154,37 @@ io.on('connection', (socket) => {
     socket.emit('spectate-started', { playerNames: room.playerNames, gameState: room.gameState });
   });
 
-  // ── LEADERBOARD REQUEST ────────────────────────────────────
+  // ── LEADERBOARD ──────────────────────────────────────────────
   socket.on('get-leaderboard', async ({ sortBy }) => {
     const rows = await fetchLeaderboard(sortBy);
     socket.emit('leaderboard-data', { rows });
   });
 
-  // ── ATTACK RELAY ───────────────────────────────────────────
+  // ── MATCH HISTORY ────────────────────────────────────────────
+  socket.on('get-match-history', async ({ username }) => {
+    const rows = await fetchMatchHistory(username);
+    socket.emit('match-history-data', { rows });
+  });
+
+  // ── ATTACK ───────────────────────────────────────────────────
   socket.on('send-attack', ({ type, roomCode }) => {
     socket.to(roomCode).emit('receive-attack', { type });
   });
 
-  // ── ROUND SOLVED ───────────────────────────────────────────
-  // Client sends roundsSolved count and optional bestRoundMs for this round
+  // ── ROUND SOLVED ─────────────────────────────────────────────
   socket.on('round-solved', ({ roomCode, points, newRoundIndex, roundMs }) => {
     const room = rooms[roomCode];
     if (!room) return;
-
-    // Update server-side stats for this player
     if (room.playerStats[socket.id]) {
       const ps = room.playerStats[socket.id];
       ps.points       = points;
-      ps.roundsSolved = newRoundIndex; // newRoundIndex = number of rounds solved so far
-      if (roundMs) {
-        ps.bestRoundMs = ps.bestRoundMs === null ? roundMs : Math.min(ps.bestRoundMs, roundMs);
-      }
+      ps.roundsSolved = newRoundIndex;
+      if (roundMs) ps.bestRoundMs = ps.bestRoundMs === null ? roundMs : Math.min(ps.bestRoundMs, roundMs);
     }
-
     socket.to(roomCode).emit('opponent-advanced', {
       opponentPoints:     points,
       opponentRoundIndex: newRoundIndex,
     });
-
     if (!room.gameState) room.gameState = { players: [{},{}] };
     const idx = room.players.indexOf(socket.id);
     if (idx !== -1) {
@@ -179,7 +193,7 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ── LIVE POINTS SYNC ───────────────────────────────────────
+  // ── LIVE POINTS SYNC ──────────────────────────────────────────
   socket.on('my-points-update', ({ roomCode, points, playerName, challenge, timeLeft }) => {
     const room = rooms[roomCode];
     if (room?.playerStats?.[socket.id]) room.playerStats[socket.id].points = points;
@@ -194,45 +208,46 @@ io.on('connection', (socket) => {
     }
   });
 
-  // ── MATCH WON (500 pts) ────────────────────────────────────
+  // ── MATCH WON (500 pts) ───────────────────────────────────────
   socket.on('match-won', async ({ roomCode, winnerPoints }) => {
     const room = rooms[roomCode];
     socket.to(roomCode).emit('match-over', { winnerPoints });
     if (room) {
-      await saveMatchResults(room, socket.id, winnerPoints);
+      const durationS = room.startedAt ? Math.floor((Date.now() - room.startedAt) / 1000) : 0;
+      await saveMatchResults({ room, winnerSocketId: socket.id, isDraw: false, matchDurationS: durationS });
       delete rooms[roomCode];
     }
-    console.log(`Match over in ${roomCode} — winner: ${winnerPoints}pts`);
   });
 
-  // ── TIMER EXPIRED ──────────────────────────────────────────
+  // ── TIME UP ───────────────────────────────────────────────────
   socket.on('time-up', async ({ roomCode, myPoints, opponentPoints: oppPts }) => {
     const room = rooms[roomCode];
     socket.to(roomCode).emit('opponent-time-up');
     if (room) {
-      // Determine winner by points
-      const myIdx  = room.players.indexOf(socket.id);
-      const oppIdx = myIdx === 0 ? 1 : 0;
-      const myWon  = (myPoints || 0) > (oppPts || 0);
-      // Save both
-      const winnerId = myWon ? socket.id : room.players[oppIdx];
-      const winPts   = myWon ? (myPoints || 0) : (oppPts || 0);
-      await saveMatchResults(room, winnerId, winPts);
+      const durationS  = room.startedAt ? Math.floor((Date.now() - room.startedAt) / 1000) : 0;
+      const myIdx      = room.players.indexOf(socket.id);
+      const oppIdx     = myIdx === 0 ? 1 : 0;
+      const isDraw     = (myPoints || 0) === (oppPts || 0);
+      const winnerSocketId = isDraw ? null
+        : (myPoints || 0) > (oppPts || 0) ? socket.id : room.players[oppIdx];
+      // Update final points in stats
+      if (room.playerStats[socket.id])           room.playerStats[socket.id].points = myPoints || 0;
+      if (room.playerStats[room.players[oppIdx]]) room.playerStats[room.players[oppIdx]].points = oppPts || 0;
+      await saveMatchResults({ room, winnerSocketId, isDraw, matchDurationS: durationS });
       delete rooms[roomCode];
     }
   });
 
-  // ── DISCONNECT ─────────────────────────────────────────────
+  // ── DISCONNECT ────────────────────────────────────────────────
   socket.on('disconnect', async () => {
     const roomCode = socket.roomCode;
     if (roomCode && rooms[roomCode] && !socket.isSpectator) {
-      const room = rooms[roomCode];
+      const room          = rooms[roomCode];
+      const oppSocketId   = room.players.find(id => id !== socket.id);
       socket.to(roomCode).emit('opponent-disconnected');
-      // Disconnecting player counts as a loss; opponent wins
-      const oppSocketId = room.players.find(id => id !== socket.id);
-      if (oppSocketId) {
-        const oppStats = room.playerStats?.[oppSocketId] || {};
-        await saveMatchResults(room, oppSocketId, oppStats.points || 0);
+      if (oppSocketId && room.startedAt) {
+        const durationS = Math.floor((Date.now() - room.startedAt) / 1000);
+        await saveMatchResults({ room, winnerSocketId: oppSocketId, isDraw: false, matchDurationS: durationS });
       }
       delete rooms[roomCode];
     }

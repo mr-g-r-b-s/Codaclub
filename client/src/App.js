@@ -1,7 +1,16 @@
 import React, { useEffect, useState, useRef, useCallback } from 'react';
 import io from 'socket.io-client';
 import Editor from "@monaco-editor/react";
+import { createClient } from '@supabase/supabase-js';
 import './App.css';
+
+// ─────────────────────────────────────────────
+// SUPABASE CLIENT (frontend - uses anon key)
+// ─────────────────────────────────────────────
+const supabase = createClient(
+  process.env.REACT_APP_SUPABASE_URL,
+  process.env.REACT_APP_SUPABASE_ANON_KEY
+);
 
 // ─────────────────────────────────────────────
 // LANGUAGE CONFIG
@@ -114,7 +123,7 @@ const CHALLENGES = [
       python:     { starterCode: `def safe_length(s):\n    return len(s)  # bug: no None check`, fixPatterns: ['if\\s+(not\\s+s|s\\s+is\\s+None)|return\\s+0\\s+if\\s+(not\\s+s|s\\s+is\\s+None)'], bugPatterns: ['return\\s+len\\s*\\(\\s*s\\s*\\)$'] },
       java:       { starterCode: `public int safeLength(String s) {\n    return s.length(); // bug: no null check\n}`, fixPatterns: ['s\\s*==\\s*null|Objects\\.isNull'], bugPatterns: ['return\\s+s\\.length\\(\\)\\s*;\\s*//\\s*bug'] },
       cpp:        { starterCode: `int safeLength(string* s) {\n    return s->length(); // bug: no null check\n}`, fixPatterns: ['s\\s*==\\s*nullptr|if\\s*\\(!\\s*s'], bugPatterns: ['s->length\\(\\)\\s*;\\s*//\\s*bug'] },
-      sql:        { starterCode: `SELECT user_id, LEN(bio) AS bio_length\nFROM profiles;`, fixPatterns: ['COALESCE|ISNULL|IFNULL'], bugPatterns: ['LEN\\s*\\(\\s*bio\\s*\\)\\s*AS\\s+bio_length\\s*$'] },
+      sql:        { starterCode: `SELECT user_id, LEN(bio) AS bio_length\nFROM profiles;`, fixPatterns: ['COALESCE|ISNULL|IFNULL'], bugPatterns: ['LEN\\s*\\(\\s*bio\\s*\\)\\s*AS\\s+bio_length$'] },
     },
   },
   {
@@ -125,7 +134,7 @@ const CHALLENGES = [
       python:     { starterCode: `def sort_asc(arr):\n    return sorted(arr, reverse=True)  # bug here`, fixPatterns: ['sorted\\s*\\(\\s*arr\\s*\\)|reverse\\s*=\\s*False'], bugPatterns: ['reverse\\s*=\\s*True'] },
       java:       { starterCode: `public int[] sortAsc(int[] arr) {\n    Arrays.sort(arr, (a, b) -> b - a); // bug here\n    return arr;\n}`, fixPatterns: ['a\\s*-\\s*b|Arrays\\.sort\\s*\\(\\s*arr\\s*\\)'], bugPatterns: ['b\\s*-\\s*a'] },
       cpp:        { starterCode: `vector<int> sortAsc(vector<int> arr) {\n    sort(arr.begin(), arr.end(), greater<int>()); // bug\n    return arr;\n}`, fixPatterns: ['less\\s*<|sort\\s*\\(\\s*arr\\.begin\\(\\)\\s*,\\s*arr\\.end\\(\\)\\s*\\)'], bugPatterns: ['greater\\s*<'] },
-      sql:        { starterCode: `SELECT name, price FROM products\nORDER BY price DESC;`, fixPatterns: ['ORDER\\s+BY\\s+price\\s+ASC|ORDER\\s+BY\\s+price\\s*$'], bugPatterns: ['ORDER\\s+BY\\s+price\\s+DESC'] },
+      sql:        { starterCode: `SELECT name, price FROM products\nORDER BY price DESC;`, fixPatterns: ['ORDER\\s+BY\\s+price\\s+ASC|ORDER\\s+BY\\s+price$'], bugPatterns: ['ORDER\\s+BY\\s+price\\s+DESC'] },
     },
   },
   {
@@ -166,44 +175,57 @@ const WIN_SCORE       = 500;
 const MATCH_DURATION  = 5 * 60;
 const BONUS_SECONDS   = 10;
 const PENALTY_SECONDS = 10;
+const AVATAR_COLORS   = ['#00f5ff','#ff006e','#ffbe0b','#06d6a0','#a855f7','#f97316'];
 
 function generateRoomCode() {
   return Math.random().toString(36).substring(2, 8).toUpperCase();
 }
 
-// ─────────────────────────────────────────────
-// TEST RUNNER
-// ─────────────────────────────────────────────
-function runTests(code, challenge, language) {
-  if (language === 'javascript') {
-    try {
-      const { fnName, tests } = challenge.variants.javascript;
-      for (const test of tests) {
-        const args = test.slice(0, -1);
-        const expected = test[test.length - 1];
-        // eslint-disable-next-line no-new-func
-        const result = new Function(`${code}\nreturn ${fnName}(${args.map(a => JSON.stringify(a)).join(',')});`)();
-        if (JSON.stringify(result) !== JSON.stringify(expected)) return false;
-      }
-      return true;
-    } catch { return false; }
-  } else {
-    const variant = challenge.variants[language];
-    if (!variant) return false;
-    const { fixPatterns, bugPatterns, starterCode } = variant;
-    if (bugPatterns?.some(p => new RegExp(p, 'i').test(code))) return false;
-    if (fixPatterns && !fixPatterns.some(p => new RegExp(p, 'i').test(code))) return false;
-    if (code.trim() === starterCode.trim()) return false;
-    return true;
-  }
+function getAvatarColor(username) {
+  let hash = 0;
+  for (let i = 0; i < username.length; i++) hash = username.charCodeAt(i) + ((hash << 5) - hash);
+  return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
+}
+
+function Avatar({ username, size = 44 }) {
+  const color  = getAvatarColor(username || '?');
+  const initials = (username || '?').slice(0, 2).toUpperCase();
+  return (
+    <div style={{
+      width: size, height: size, borderRadius: 4,
+      background: `${color}22`,
+      border: `1.5px solid ${color}`,
+      display: 'flex', alignItems: 'center', justifyContent: 'center',
+      fontFamily: "'Orbitron', sans-serif", fontWeight: 900,
+      fontSize: size * 0.35, color,
+      boxShadow: `0 0 10px ${color}44`,
+      flexShrink: 0,
+    }}>{initials}</div>
+  );
 }
 
 function formatTime(s) {
   return `${Math.floor(s/60)}:${String(s%60).padStart(2,'0')}`;
 }
 
+function formatMs(ms) {
+  if (!ms) return '—';
+  if (ms < 60000) return `${(ms/1000).toFixed(1)}s`;
+  return `${Math.floor(ms/60000)}m ${((ms%60000)/1000).toFixed(0)}s`;
+}
+
+function timeAgo(dateStr) {
+  const diff = Date.now() - new Date(dateStr).getTime();
+  const m = Math.floor(diff / 60000);
+  if (m < 1)  return 'just now';
+  if (m < 60) return `${m}m ago`;
+  const h = Math.floor(m / 60);
+  if (h < 24) return `${h}h ago`;
+  return `${Math.floor(h/24)}d ago`;
+}
+
 // ─────────────────────────────────────────────
-// SFX ENGINE
+// SFX
 // ─────────────────────────────────────────────
 const SFX = (() => {
   let ctx = null;
@@ -222,48 +244,231 @@ const SFX = (() => {
 })();
 
 // ─────────────────────────────────────────────
-// OPPONENT ADVANCED POPUP (big, must dismiss)
+// TEST RUNNER
 // ─────────────────────────────────────────────
-function OpponentAdvancedPopup({ data, onDismiss }) {
-  if (!data) return null;
+function runTests(code, challenge, language) {
+  if (language === 'javascript') {
+    try {
+      const { fnName, tests } = challenge.variants.javascript;
+      for (const test of tests) {
+        const args = test.slice(0, -1);
+        const expected = test[test.length - 1];
+        // eslint-disable-next-line no-new-func
+        const result = new Function(`${code}\nreturn ${fnName}(${args.map(a=>JSON.stringify(a)).join(',')});`)();
+        if (JSON.stringify(result) !== JSON.stringify(expected)) return false;
+      }
+      return true;
+    } catch { return false; }
+  } else {
+    const variant = challenge.variants[language];
+    if (!variant) return false;
+    const { fixPatterns, bugPatterns, starterCode } = variant;
+    if (bugPatterns?.some(p => new RegExp(p,'i').test(code))) return false;
+    if (fixPatterns && !fixPatterns.some(p => new RegExp(p,'i').test(code))) return false;
+    if (code.trim() === starterCode.trim()) return false;
+    return true;
+  }
+}
+
+// ══════════════════════════════════════════════
+// AUTH SCREEN
+// ══════════════════════════════════════════════
+function AuthScreen({ onAuth }) {
+  const [loading, setLoading] = useState(false);
+  const [error,   setError]   = useState('');
+
+  const handleGoogle = async () => {
+    setLoading(true); setError('');
+    const { error } = await supabase.auth.signInWithOAuth({
+      provider: 'google',
+      options: { redirectTo: window.location.origin },
+    });
+    if (error) { setError(error.message); setLoading(false); }
+  };
+
+  const handleGuest = () => {
+    onAuth({ isGuest: true, username: null, user: null });
+  };
+
   return (
-    <div className="opp-popup-overlay">
-      <div className="opp-popup-modal">
-        <div className="opp-popup-icon">⚡</div>
-        <div className="opp-popup-title">OPPONENT ADVANCED!</div>
-        <div className="opp-popup-body">
-          Your opponent solved the round and is now on
-          <span className="opp-popup-round"> Round {data.opponentRoundIndex + 1}</span>
+    <div className="auth-screen">
+      <div className="auth-logo">CODACLUB</div>
+      <div className="auth-tagline">// competitive bug-fixing arena_</div>
+      <div className="auth-card">
+        <div className="auth-card-title">WELCOME, CODER</div>
+        <p className="auth-card-sub">Sign in to save your stats and appear on the leaderboard.</p>
+
+        <button className="btn-google" onClick={handleGoogle} disabled={loading}>
+          {loading ? '⟳ Connecting...' : (
+            <><span className="google-icon">G</span> SIGN IN WITH GOOGLE</>
+          )}
+        </button>
+
+        <div className="auth-divider">OR</div>
+
+        <button className="btn-guest" onClick={handleGuest}>
+          PLAY AS GUEST
+          <span className="guest-note">stats won't be saved</span>
+        </button>
+
+        {error && <div className="auth-error">⚠ {error}</div>}
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════
+// USERNAME SETUP SCREEN (first login only)
+// ══════════════════════════════════════════════
+function UsernameSetupScreen({ user, onComplete }) {
+  const [username, setUsername] = useState('');
+  const [checking, setChecking] = useState(false);
+  const [error,    setError]    = useState('');
+  const [saving,   setSaving]   = useState(false);
+
+  const validate = (val) => {
+    if (val.length < 3)  return 'Min 3 characters';
+    if (val.length > 16) return 'Max 16 characters';
+    if (!/^[a-zA-Z0-9_]+$/.test(val)) return 'Only letters, numbers, underscore';
+    return '';
+  };
+
+  const handleChange = (e) => {
+    const val = e.target.value;
+    setUsername(val);
+    setError(validate(val));
+  };
+
+  const handleSubmit = async () => {
+    const err = validate(username);
+    if (err) { setError(err); return; }
+
+    setChecking(true); setError('');
+    const { data: taken } = await supabase.rpc('is_username_taken', { p_username: username });
+    if (taken) { setError('Username already taken!'); setChecking(false); return; }
+    setChecking(false);
+
+    setSaving(true);
+    const color = getAvatarColor(username);
+    const { error: saveErr } = await supabase.from('profiles').insert({
+      user_id:      user.id,
+      username:     username.toLowerCase(),
+      avatar_color: color,
+    });
+    setSaving(false);
+    if (saveErr) { setError(saveErr.message); return; }
+    onComplete(username.toLowerCase());
+  };
+
+  return (
+    <div className="auth-screen">
+      <div className="auth-logo">CODACLUB</div>
+      <div className="auth-card">
+        <div className="auth-card-title">CHOOSE YOUR HANDLE</div>
+        <p className="auth-card-sub">This is your permanent username. Choose wisely.</p>
+
+        <div className="username-preview">
+          <Avatar username={username || '??'} size={52} />
+          <div className="username-preview-text">
+            {username || 'your_handle'}
+          </div>
         </div>
-        <div className="opp-popup-score">
-          Their score: <span className="opp-popup-pts">{data.opponentPoints} pts</span>
-        </div>
-        <div className="opp-popup-hint">
-          ⏱ You lost {PENALTY_SECONDS}s — stay focused and finish your round!
-        </div>
-        <button className="opp-popup-btn" onClick={onDismiss}>
-          BACK TO BATTLE ▶
+
+        <input
+          className="lobby-input"
+          placeholder="your_handle"
+          value={username}
+          onChange={handleChange}
+          maxLength={16}
+          style={{ textAlign: 'center', letterSpacing: '.1em' }}
+        />
+        <div className="username-rules">3–16 chars · letters, numbers, underscore only</div>
+
+        {error && <div className="auth-error">⚠ {error}</div>}
+
+        <button className="btn-primary" onClick={handleSubmit} disabled={checking || saving || !!validate(username)}>
+          {checking ? '⟳ Checking...' : saving ? '⟳ Saving...' : 'LOCK IN USERNAME ▶'}
         </button>
       </div>
     </div>
   );
 }
 
-// ─────────────────────────────────────────────
-// LEADERBOARD COMPONENT
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════
+// PROFILE CARD (shown in lobby)
+// ══════════════════════════════════════════════
+function ProfileCard({ username, socket, onSignOut }) {
+  const [stats,   setStats]   = useState(null);
+  const [history, setHistory] = useState([]);
+  const [open,    setOpen]    = useState(false);
+
+  useEffect(() => {
+    if (!username) return;
+    // Fetch stats from leaderboard table
+    supabase.from('players').select('*').eq('username', username.toLowerCase()).single()
+      .then(({ data }) => setStats(data));
+    // Fetch match history via socket
+    socket.emit('get-match-history', { username });
+    socket.on('match-history-data', ({ rows }) => setHistory(rows));
+    return () => socket.off('match-history-data');
+  }, [username, socket]);
+
+  return (
+    <div className="profile-card">
+      <div className="profile-card-top" onClick={() => setOpen(o => !o)}>
+        <Avatar username={username} size={40} />
+        <div className="profile-card-info">
+          <div className="profile-card-name">{username}</div>
+          <div className="profile-card-sub">
+            {stats ? `${stats.wins}W · ${stats.losses}L · ${stats.total_points}pts` : 'No matches yet'}
+          </div>
+        </div>
+        <div className="profile-card-chevron">{open ? '▲' : '▼'}</div>
+      </div>
+
+      {open && (
+        <div className="profile-card-expanded">
+          {stats && (
+            <div className="profile-stats-grid">
+              <div className="pstat"><div className="pstat-val" style={{color:'var(--neon-green)'}}>{stats.wins}</div><div className="pstat-label">WINS</div></div>
+              <div className="pstat"><div className="pstat-val" style={{color:'var(--neon-pink)'}}>{stats.losses}</div><div className="pstat-label">LOSSES</div></div>
+              <div className="pstat"><div className="pstat-val" style={{color:'var(--neon-cyan)'}}>{stats.total_points}</div><div className="pstat-label">TOTAL PTS</div></div>
+              <div className="pstat"><div className="pstat-val" style={{color:'var(--neon-yellow)'}}>🔥{stats.max_streak}</div><div className="pstat-label">BEST STREAK</div></div>
+              <div className="pstat"><div className="pstat-val">{stats.rounds_solved}</div><div className="pstat-label">ROUNDS</div></div>
+              <div className="pstat"><div className="pstat-val" style={{fontSize:'.8rem'}}>{formatMs(stats.best_round_ms)}</div><div className="pstat-label">BEST TIME</div></div>
+            </div>
+          )}
+
+          {history.length > 0 && (
+            <div className="profile-history">
+              <div className="profile-history-title">RECENT MATCHES</div>
+              {history.slice(0,5).map((h, i) => (
+                <div key={i} className={`history-row ${h.result}`}>
+                  <span className={`history-result ${h.result}`}>{h.result.toUpperCase()}</span>
+                  <span className="history-opp">vs {h.opponent}</span>
+                  <span className="history-pts">{h.my_points}pts</span>
+                  <span className="history-time">{timeAgo(h.played_at)}</span>
+                </div>
+              ))}
+            </div>
+          )}
+
+          <button className="btn-signout" onClick={onSignOut}>SIGN OUT</button>
+        </div>
+      )}
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════
+// LEADERBOARD
+// ══════════════════════════════════════════════
 const SORT_OPTIONS = [
   { key: 'wins',         label: '🏆 Wins'         },
   { key: 'total_points', label: '⚡ Total Points'  },
   { key: 'max_streak',   label: '🔥 Best Streak'   },
   { key: 'rounds',       label: '🧠 Rounds Solved' },
 ];
-
-function formatMs(ms) {
-  if (!ms) return '—';
-  if (ms < 60000) return `${(ms/1000).toFixed(1)}s`;
-  return `${Math.floor(ms/60000)}m ${((ms%60000)/1000).toFixed(0)}s`;
-}
 
 function Leaderboard({ socket, onClose, highlightName }) {
   const [rows,    setRows]    = useState([]);
@@ -281,8 +486,6 @@ function Leaderboard({ socket, onClose, highlightName }) {
     return () => socket.off('leaderboard-data');
   }, [socket, load, sortBy]);
 
-  const handleSort = (key) => { setSortBy(key); load(key); };
-
   const medals = ['🥇','🥈','🥉'];
 
   return (
@@ -292,22 +495,15 @@ function Leaderboard({ socket, onClose, highlightName }) {
           <div className="lb-title">🏆 LEADERBOARD</div>
           <button className="lb-close" onClick={onClose}>✕</button>
         </div>
-
         <div className="lb-sort-row">
           {SORT_OPTIONS.map(o => (
-            <button key={o.key}
-              className={`lb-sort-btn ${sortBy === o.key ? 'active' : ''}`}
-              onClick={() => handleSort(o.key)}>
-              {o.label}
-            </button>
+            <button key={o.key} className={`lb-sort-btn ${sortBy===o.key?'active':''}`}
+              onClick={() => { setSortBy(o.key); load(o.key); }}>{o.label}</button>
           ))}
         </div>
-
-        {loading ? (
-          <div className="lb-loading">⟳ Loading ranks...</div>
-        ) : rows.length === 0 ? (
-          <div className="lb-empty">No matches played yet. Be the first!</div>
-        ) : (
+        {loading ? <div className="lb-loading">⟳ Loading ranks...</div>
+        : rows.length === 0 ? <div className="lb-empty">No matches yet. Be the first!</div>
+        : (
           <div className="lb-table">
             <div className="lb-row lb-thead">
               <span className="lb-col-rank">#</span>
@@ -320,51 +516,66 @@ function Leaderboard({ socket, onClose, highlightName }) {
               <span className="lb-col-stat">BEST</span>
             </div>
             {rows.map((row, i) => {
-              const isMe = row.name === (highlightName || '').toLowerCase();
+              const isMe = row.username === (highlightName||'').toLowerCase();
               return (
-                <div key={row.name} className={`lb-row ${isMe ? 'lb-row-me' : ''} ${i < 3 ? 'lb-row-top' : ''}`}>
-                  <span className="lb-col-rank">{medals[i] || i + 1}</span>
+                <div key={row.username} className={`lb-row ${isMe?'lb-row-me':''} ${i<3?'lb-row-top':''}`}>
+                  <span className="lb-col-rank">{medals[i]||i+1}</span>
                   <span className="lb-col-name">
-                    {row.name}
+                    <Avatar username={row.username} size={24} />
+                    {row.username}
                     {isMe && <span className="lb-you-tag">YOU</span>}
                   </span>
                   <span className="lb-col-stat" style={{color:'var(--neon-green)'}}>{row.wins}</span>
                   <span className="lb-col-stat" style={{color:'var(--neon-pink)'}}>{row.losses}</span>
                   <span className="lb-col-stat" style={{color:'var(--neon-cyan)'}}>{row.total_points}</span>
                   <span className="lb-col-stat">{row.rounds_solved}</span>
-                  <span className="lb-col-stat" style={{color:'var(--neon-yellow)'}}>
-                    {row.max_streak > 0 ? `🔥${row.max_streak}` : '—'}
-                  </span>
-                  <span className="lb-col-stat" style={{color:'rgba(136,146,176,0.7)',fontSize:'.72rem'}}>
-                    {formatMs(row.best_round_ms)}
-                  </span>
+                  <span className="lb-col-stat" style={{color:'var(--neon-yellow)'}}>{row.max_streak>0?`🔥${row.max_streak}`:'—'}</span>
+                  <span className="lb-col-stat" style={{fontSize:'.72rem',color:'rgba(136,146,176,0.7)'}}>{formatMs(row.best_round_ms)}</span>
                 </div>
               );
             })}
           </div>
         )}
-
         <div className="lb-footer">Top 10 players · Updates after every match</div>
       </div>
     </div>
   );
 }
 
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════
+// OPPONENT ADVANCED POPUP
+// ══════════════════════════════════════════════
+function OpponentAdvancedPopup({ data, onDismiss }) {
+  if (!data) return null;
+  return (
+    <div className="opp-popup-overlay">
+      <div className="opp-popup-modal">
+        <div className="opp-popup-icon">⚡</div>
+        <div className="opp-popup-title">OPPONENT ADVANCED!</div>
+        <div className="opp-popup-body">Your opponent solved the round and is now on <span className="opp-popup-round">Round {data.opponentRoundIndex+1}</span></div>
+        <div className="opp-popup-score">Their score: <span className="opp-popup-pts">{data.opponentPoints} pts</span></div>
+        <div className="opp-popup-hint">⏱ You lost {PENALTY_SECONDS}s — stay focused and finish your round!</div>
+        <button className="opp-popup-btn" onClick={onDismiss}>BACK TO BATTLE ▶</button>
+      </div>
+    </div>
+  );
+}
+
+// ══════════════════════════════════════════════
 // LOBBY
-// ─────────────────────────────────────────────
-function LobbyScreen({ onJoinGame, onSpectate, socket }) {
-  const [screen, setScreen]         = useState('main');
-  const [playerName, setPlayerName] = useState('');
-  const [roomCode, setRoomCode]     = useState('');
-  const [genCode, setGenCode]       = useState('');
-  const [error, setError]           = useState('');
-  const [waiting, setWaiting]       = useState(false);
-  const [showLB, setShowLB]         = useState(false);
+// ══════════════════════════════════════════════
+function LobbyScreen({ authUser, onJoinGame, onSpectate, onSignOut, socket }) {
+  const [screen,    setScreen]    = useState('main');
+  const [playerName,setPlayerName]= useState(authUser.isGuest ? '' : authUser.username);
+  const [roomCode,  setRoomCode]  = useState('');
+  const [genCode,   setGenCode]   = useState('');
+  const [error,     setError]     = useState('');
+  const [waiting,   setWaiting]   = useState(false);
+  const [showLB,    setShowLB]    = useState(false);
 
   useEffect(() => {
     socket.on('match-ready', ({ roundSequence, playerNames }) => {
-      onJoinGame(roomCode || genCode, playerName || 'Player', roundSequence, playerNames);
+      onJoinGame(roomCode || genCode, playerName, roundSequence);
     });
     socket.on('spectate-started', ({ playerNames, gameState }) => {
       onSpectate(roomCode.trim().toUpperCase(), playerNames, gameState);
@@ -373,18 +584,29 @@ function LobbyScreen({ onJoinGame, onSpectate, socket }) {
     return () => { socket.off('match-ready'); socket.off('room-error'); socket.off('spectate-started'); };
   }, [playerName, roomCode, genCode, onJoinGame, onSpectate, socket]);
 
+  const emitCreateJoin = (type, code, name) => {
+    socket.emit(type, {
+      roomCode:    code,
+      playerName:  name,
+      isLoggedIn:  !authUser.isGuest,
+      username:    authUser.username || name,
+    });
+  };
+
   const handleCreate = () => {
-    if (!playerName.trim()) { setError('Enter your name!'); return; }
+    const name = authUser.isGuest ? playerName.trim() : authUser.username;
+    if (!name) { setError('Enter your name!'); return; }
     const code = generateRoomCode();
     setGenCode(code); setWaiting(true); setError('');
-    socket.emit('create-room', { roomCode: code, playerName: playerName.trim() });
+    emitCreateJoin('create-room', code, name);
   };
 
   const handleJoin = () => {
-    if (!playerName.trim()) { setError('Enter your name!'); return; }
-    if (!roomCode.trim())   { setError('Enter a room code!'); return; }
+    const name = authUser.isGuest ? playerName.trim() : authUser.username;
+    if (!name)          { setError('Enter your name!'); return; }
+    if (!roomCode.trim()) { setError('Enter a room code!'); return; }
     setError(''); setWaiting(true);
-    socket.emit('join-room', { roomCode: roomCode.trim().toUpperCase(), playerName: playerName.trim() });
+    emitCreateJoin('join-room', roomCode.trim().toUpperCase(), name);
   };
 
   const handleSpectate = () => {
@@ -393,20 +615,37 @@ function LobbyScreen({ onJoinGame, onSpectate, socket }) {
     socket.emit('spectate-room', { roomCode: roomCode.trim().toUpperCase() });
   };
 
+  const displayName = authUser.isGuest ? playerName : authUser.username;
+
   return (
     <div className="lobby-screen">
-      {showLB && <Leaderboard socket={socket} onClose={() => setShowLB(false)} highlightName={playerName} />}
+      {showLB && <Leaderboard socket={socket} onClose={() => setShowLB(false)} highlightName={authUser.username} />}
+
       <div className="lobby-logo">CODACLUB</div>
       <div className="lobby-tagline">// competitive bug-fixing arena_</div>
+
+      {/* Profile card for logged-in users */}
+      {!authUser.isGuest && (
+        <ProfileCard username={authUser.username} socket={socket} onSignOut={onSignOut} />
+      )}
+
       <div className="lobby-card">
         {screen === 'main' && (<>
-          <div className="lobby-card-title">ENTER YOUR NAME</div>
-          <input className="lobby-input" placeholder="your_handle" value={playerName}
-            onChange={e => { setPlayerName(e.target.value); setError(''); }} maxLength={16} />
-          <div style={{height:20}}/>
-          <button className="btn-primary" onClick={() => { if (!playerName.trim()){setError('Enter your name!');return;} setScreen('create');setError(''); }}>CREATE ROOM</button>
+          <div className="lobby-card-title">{authUser.isGuest ? 'ENTER YOUR NAME' : `WELCOME BACK, ${authUser.username?.toUpperCase()}`}</div>
+
+          {authUser.isGuest && (
+            <input className="lobby-input" placeholder="your_handle" value={playerName}
+              onChange={e => { setPlayerName(e.target.value); setError(''); }} maxLength={16} />
+          )}
+
+          {authUser.isGuest && (
+            <div className="guest-warning">⚠ Playing as guest — stats won't be saved</div>
+          )}
+
+          <div style={{height: authUser.isGuest ? 16 : 4}}/>
+          <button className="btn-primary" onClick={() => { const n = authUser.isGuest ? playerName.trim() : authUser.username; if (!n){setError('Enter your name!');return;} setScreen('create');setError(''); }}>CREATE ROOM</button>
           <div className="lobby-divider">OR</div>
-          <button className="btn-secondary" onClick={() => { if (!playerName.trim()){setError('Enter your name!');return;} setScreen('join');setError(''); }}>JOIN ROOM</button>
+          <button className="btn-secondary" onClick={() => { const n = authUser.isGuest ? playerName.trim() : authUser.username; if (!n){setError('Enter your name!');return;} setScreen('join');setError(''); }}>JOIN ROOM</button>
           <div className="lobby-divider">OR</div>
           <button className="btn-spectate" onClick={() => setScreen('spectate')}>👁 SPECTATE BATTLE</button>
           <div className="lobby-divider">OR</div>
@@ -416,9 +655,7 @@ function LobbyScreen({ onJoinGame, onSpectate, socket }) {
 
         {screen === 'create' && !waiting && (<>
           <div className="lobby-card-title">CREATE ROOM</div>
-          <p style={{fontFamily:'Share Tech Mono',color:'var(--text-mid)',fontSize:'.85rem',marginBottom:'20px',lineHeight:1.6}}>
-            A room code will be generated.<br/>Share it with your opponent.
-          </p>
+          <p style={{fontFamily:'Share Tech Mono',color:'var(--text-mid)',fontSize:'.85rem',marginBottom:'20px',lineHeight:1.6}}>Playing as <strong style={{color:'var(--neon-cyan)'}}>{displayName || '?'}</strong><br/>Share the code with your opponent.</p>
           <button className="btn-primary" onClick={handleCreate}>GENERATE ROOM CODE</button>
           <div style={{height:10}}/>
           <button className="btn-secondary" onClick={() => setScreen('main')}>BACK</button>
@@ -438,12 +675,12 @@ function LobbyScreen({ onJoinGame, onSpectate, socket }) {
         {screen === 'join' && (<>
           <div className="lobby-card-title">JOIN ROOM</div>
           <input className="lobby-input" placeholder="ROOM CODE" value={roomCode}
-            onChange={e => { setRoomCode(e.target.value.toUpperCase());setError(''); }}
-            maxLength={6} style={{textAlign:'center',letterSpacing:'.4em',fontSize:'1.2rem'}} />
+            onChange={e=>{setRoomCode(e.target.value.toUpperCase());setError('');}}
+            maxLength={6} style={{textAlign:'center',letterSpacing:'.4em',fontSize:'1.2rem'}}/>
           {!waiting ? (<>
             <button className="btn-primary" onClick={handleJoin}>JOIN BATTLE</button>
             <div style={{height:10}}/>
-            <button className="btn-secondary" onClick={() => setScreen('main')}>BACK</button>
+            <button className="btn-secondary" onClick={()=>setScreen('main')}>BACK</button>
           </>) : <div className="waiting-text">⟳ Connecting...</div>}
           {error && <div className="lobby-error">⚠ {error}</div>}
         </>)}
@@ -451,13 +688,13 @@ function LobbyScreen({ onJoinGame, onSpectate, socket }) {
         {screen === 'spectate' && (<>
           <div className="lobby-card-title">👁 SPECTATE</div>
           <input className="lobby-input" placeholder="ROOM CODE" value={roomCode}
-            onChange={e => { setRoomCode(e.target.value.toUpperCase());setError(''); }}
-            maxLength={6} style={{textAlign:'center',letterSpacing:'.4em',fontSize:'1.2rem'}} />
+            onChange={e=>{setRoomCode(e.target.value.toUpperCase());setError('');}}
+            maxLength={6} style={{textAlign:'center',letterSpacing:'.4em',fontSize:'1.2rem'}}/>
           {!waiting ? (<>
             <button className="btn-primary" onClick={handleSpectate}>WATCH LIVE</button>
             <div style={{height:10}}/>
-            <button className="btn-secondary" onClick={() => setScreen('main')}>BACK</button>
-          </>) : <div className="waiting-text">⟳ Joining as spectator...</div>}
+            <button className="btn-secondary" onClick={()=>setScreen('main')}>BACK</button>
+          </>) : <div className="waiting-text">⟳ Joining...</div>}
           {error && <div className="lobby-error">⚠ {error}</div>}
         </>)}
       </div>
@@ -465,19 +702,19 @@ function LobbyScreen({ onJoinGame, onSpectate, socket }) {
   );
 }
 
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════
 // SPECTATOR SCREEN
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════
 function SpectatorScreen({ roomCode, playerNames, initialGameState, socket, onLeave }) {
-  const [gameState, setGameState] = useState(initialGameState || { players: [{},{}] });
+  const [gameState, setGameState] = useState(initialGameState||{players:[{},{}]});
   useEffect(() => {
     SFX.roundStart();
-    socket.on('spectate-state-update', ({ gameState: gs }) => setGameState(gs));
+    socket.on('spectate-state-update', ({gameState:gs}) => setGameState(gs));
     socket.on('opponent-disconnected', onLeave);
     return () => { socket.off('spectate-state-update'); socket.off('opponent-disconnected'); };
   }, [socket, onLeave]);
-  const p1 = gameState?.players?.[0] || {};
-  const p2 = gameState?.players?.[1] || {};
+  const p1 = gameState?.players?.[0]||{};
+  const p2 = gameState?.players?.[1]||{};
   return (
     <div className="spectator-screen">
       <div className="spectator-header">
@@ -490,23 +727,16 @@ function SpectatorScreen({ roomCode, playerNames, initialGameState, socket, onLe
           <div className="spec-player-name">{playerNames?.[0]||'P1'} <span className="spec-tag">P1</span></div>
           <div className="spec-points" style={{color:'var(--neon-cyan)'}}>{p1.points??'—'}<span style={{fontSize:'.7rem',opacity:.6}}>pts</span></div>
           <div className="spec-bar-wrap"><div className="spec-bar-fill cyan" style={{width:`${Math.min(((p1.points||0)/WIN_SCORE)*100,100)}%`}}/></div>
-          <div className="spec-challenge">
-            {p1.challenge ? <><div className="spec-challenge-title">{p1.challenge.title}</div><div className="spec-challenge-desc">{p1.challenge.description}</div></> : <div className="spec-challenge-title" style={{opacity:.4}}>Waiting...</div>}
-          </div>
-          {p1.timeLeft != null && <div className="spec-time">⏱ {formatTime(p1.timeLeft)}</div>}
+          <div className="spec-challenge">{p1.challenge?<><div className="spec-challenge-title">{p1.challenge.title}</div><div className="spec-challenge-desc">{p1.challenge.description}</div></>:<div className="spec-challenge-title" style={{opacity:.4}}>Waiting...</div>}</div>
+          {p1.timeLeft!=null&&<div className="spec-time">⏱ {formatTime(p1.timeLeft)}</div>}
         </div>
-        <div className="spectator-vs">
-          <div className="spec-vs-label">VS</div>
-          <div className="spec-win-target">🏁 First to {WIN_SCORE}pts</div>
-        </div>
+        <div className="spectator-vs"><div className="spec-vs-label">VS</div><div className="spec-win-target">🏁 First to {WIN_SCORE}pts</div></div>
         <div className="spectator-player-panel">
           <div className="spec-player-name">{playerNames?.[1]||'P2'} <span className="spec-tag pink">P2</span></div>
           <div className="spec-points" style={{color:'var(--neon-pink)'}}>{p2.points??'—'}<span style={{fontSize:'.7rem',opacity:.6}}>pts</span></div>
           <div className="spec-bar-wrap"><div className="spec-bar-fill pink" style={{width:`${Math.min(((p2.points||0)/WIN_SCORE)*100,100)}%`}}/></div>
-          <div className="spec-challenge">
-            {p2.challenge ? <><div className="spec-challenge-title">{p2.challenge.title}</div><div className="spec-challenge-desc">{p2.challenge.description}</div></> : <div className="spec-challenge-title" style={{opacity:.4}}>Waiting...</div>}
-          </div>
-          {p2.timeLeft != null && <div className="spec-time">⏱ {formatTime(p2.timeLeft)}</div>}
+          <div className="spec-challenge">{p2.challenge?<><div className="spec-challenge-title">{p2.challenge.title}</div><div className="spec-challenge-desc">{p2.challenge.description}</div></>:<div className="spec-challenge-title" style={{opacity:.4}}>Waiting...</div>}</div>
+          {p2.timeLeft!=null&&<div className="spec-time">⏱ {formatTime(p2.timeLeft)}</div>}
         </div>
       </div>
       <div className="spectator-footer">Live updates on every solve</div>
@@ -514,44 +744,44 @@ function SpectatorScreen({ roomCode, playerNames, initialGameState, socket, onLe
   );
 }
 
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════
 // GAME SCREEN
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════
 function GameScreen({ roomCode, playerName, roundSequence, socket, onPlayAgain }) {
-
-  // ── Each player independently moves through the shared sequence ──
   const [myRoundIndex,       setMyRoundIndex]       = useState(0);
   const [opponentRoundIndex, setOpponentRoundIndex] = useState(0);
-
-  // Derive challenge + language from the shared sequence
-  const currentRoundData = roundSequence[Math.min(myRoundIndex, roundSequence.length - 1)];
-  const challenge = CHALLENGES.find(c => c.id === currentRoundData.challengeId) || CHALLENGES[0];
+  const currentRoundData = roundSequence[Math.min(myRoundIndex, roundSequence.length-1)];
+  const challenge = CHALLENGES.find(c=>c.id===currentRoundData.challengeId)||CHALLENGES[0];
   const language  = currentRoundData.language;
-  const langMeta  = LANGUAGE_META[language] || LANGUAGE_META.javascript;
+  const langMeta  = LANGUAGE_META[language]||LANGUAGE_META.javascript;
 
-  const [attack,              setAttack]              = useState('');
-  const [points,              setPoints]              = useState(STARTING_POINTS);
-  const [opponentPoints,      setOpponentPoints]      = useState(STARTING_POINTS);
-  const [matchStatus,         setMatchStatus]         = useState('playing');
-  const [toast,               setToast]               = useState(null);
-  const [attackNotif,         setAttackNotif]         = useState(null);
-  const [pointsGain,          setPointsGain]          = useState(null);
-  const [oppAdvancedData,     setOppAdvancedData]     = useState(null); // big popup
-  const [bonusFlash,          setBonusFlash]          = useState(false);
-  const [penaltyFlash,        setPenaltyFlash]        = useState(false);
-  const [showLeaderboard,     setShowLeaderboard]     = useState(false);
+  const [attack,          setAttack]          = useState('');
+  const [points,          setPoints]          = useState(STARTING_POINTS);
+  const [opponentPoints,  setOpponentPoints]  = useState(STARTING_POINTS);
+  const [matchStatus,     setMatchStatus]     = useState('playing');
+  const [toast,           setToast]           = useState(null);
+  const [attackNotif,     setAttackNotif]     = useState(null);
+  const [pointsGain,      setPointsGain]      = useState(null);
+  const [oppAdvancedData, setOppAdvancedData] = useState(null);
+  const [bonusFlash,      setBonusFlash]      = useState(false);
+  const [penaltyFlash,    setPenaltyFlash]    = useState(false);
+  const [showLeaderboard, setShowLeaderboard] = useState(false);
 
-  const [timeLeft,  setTimeLeft]  = useState(MATCH_DURATION);
+  const [timeLeft,  setTimeLeft] = useState(MATCH_DURATION);
   const timeRef        = useRef(MATCH_DURATION);
   const timerRef       = useRef(null);
   const matchStatusRef = useRef('playing');
   const editorRef      = useRef(null);
   const editorKeyRef   = useRef(0);
-  const roundStartRef  = useRef(Date.now()); // track when current round started
+  const roundStartRef  = useRef(Date.now());
+  // Store opponentPoints in ref for time-up emit
+  const opponentPointsRef = useRef(STARTING_POINTS);
+  const pointsRef         = useRef(STARTING_POINTS);
 
   useEffect(() => { matchStatusRef.current = matchStatus; }, [matchStatus]);
+  useEffect(() => { opponentPointsRef.current = opponentPoints; }, [opponentPoints]);
+  useEffect(() => { pointsRef.current = points; }, [points]);
 
-  // Timer
   useEffect(() => {
     timerRef.current = setInterval(() => {
       if (matchStatusRef.current !== 'playing') { clearInterval(timerRef.current); return; }
@@ -560,7 +790,7 @@ function GameScreen({ roomCode, playerName, roundSequence, socket, onPlayAgain }
       if (timeRef.current <= 0) {
         clearInterval(timerRef.current);
         setMatchStatus('time-up');
-        socket.emit('time-up', { roomCode, myPoints: points, opponentPoints });
+        socket.emit('time-up', { roomCode, myPoints: pointsRef.current, opponentPoints: opponentPointsRef.current });
       }
     }, 1000);
     return () => clearInterval(timerRef.current);
@@ -568,152 +798,94 @@ function GameScreen({ roomCode, playerName, roundSequence, socket, onPlayAgain }
   }, []);
 
   const addBonusTime = useCallback(() => {
-    timeRef.current = Math.min(timeRef.current + BONUS_SECONDS, MATCH_DURATION);
-    setTimeLeft(timeRef.current);
-    setBonusFlash(true); setTimeout(() => setBonusFlash(false), 1200);
-    SFX.bonusTime();
+    timeRef.current = Math.min(timeRef.current+BONUS_SECONDS, MATCH_DURATION);
+    setTimeLeft(timeRef.current); setBonusFlash(true); setTimeout(()=>setBonusFlash(false),1200); SFX.bonusTime();
   }, []);
 
   const applyTimePenalty = useCallback(() => {
-    timeRef.current = Math.max(timeRef.current - PENALTY_SECONDS, 0);
-    setTimeLeft(timeRef.current);
-    setPenaltyFlash(true); setTimeout(() => setPenaltyFlash(false), 1400);
-    SFX.penaltyTime();
+    timeRef.current = Math.max(timeRef.current-PENALTY_SECONDS, 0);
+    setTimeLeft(timeRef.current); setPenaltyFlash(true); setTimeout(()=>setPenaltyFlash(false),1400); SFX.penaltyTime();
   }, []);
 
   const showToast = useCallback((type, message) => {
-    setToast({ type, message });
-    setTimeout(() => setToast(null), 3500);
+    setToast({type,message}); setTimeout(()=>setToast(null),3500);
   }, []);
 
   const syncState = useCallback((pts, chal) => {
-    socket.emit('my-points-update', {
-      roomCode, points: pts, playerName,
-      challenge: chal ? { title: chal.title, description: chal.description } : null,
-      timeLeft: timeRef.current,
-    });
+    socket.emit('my-points-update', { roomCode, points:pts, playerName,
+      challenge: chal?{title:chal.title,description:chal.description}:null,
+      timeLeft: timeRef.current });
   }, [socket, roomCode, playerName]);
 
-  // Socket events
   useEffect(() => {
-    socket.on('receive-attack', ({ type }) => {
+    socket.on('receive-attack', ({type}) => {
       setAttack(type); setAttackNotif(type);
-      setTimeout(() => setAttack(''), 5000);
-      setTimeout(() => setAttackNotif(null), 3000);
-      SFX.glitch();
+      setTimeout(()=>setAttack(''),5000); setTimeout(()=>setAttackNotif(null),3000); SFX.glitch();
     });
-
-    // ── OPPONENT SOLVED — they moved to next round, you stay put ──
-    socket.on('opponent-advanced', ({ opponentPoints: op, opponentRoundIndex: oppIdx }) => {
-      setOpponentPoints(op);
-      setOpponentRoundIndex(oppIdx);
-      if (op >= WIN_SCORE) {
-        clearInterval(timerRef.current);
-        setMatchStatus('match-lost');
-        SFX.lose();
-      } else {
-        // Play alert sound + show big popup + apply -10s
-        SFX.opponentAlert();
-        applyTimePenalty();
-        setOppAdvancedData({ opponentPoints: op, opponentRoundIndex: oppIdx });
-      }
+    socket.on('opponent-advanced', ({opponentPoints:op, opponentRoundIndex:oppIdx}) => {
+      setOpponentPoints(op); setOpponentRoundIndex(oppIdx);
+      if (op >= WIN_SCORE) { clearInterval(timerRef.current); setMatchStatus('match-lost'); SFX.lose(); }
+      else { SFX.opponentAlert(); applyTimePenalty(); setOppAdvancedData({opponentPoints:op,opponentRoundIndex:oppIdx}); }
     });
-
-    socket.on('opponent-points-update', ({ points: op }) => setOpponentPoints(op));
-    socket.on('match-over',    ()  => { clearInterval(timerRef.current); setMatchStatus('match-lost'); SFX.lose(); });
-    socket.on('opponent-time-up', () => { clearInterval(timerRef.current); setMatchStatus('time-up'); });
+    socket.on('opponent-points-update', ({points:op}) => setOpponentPoints(op));
+    socket.on('match-over',         ()  => { clearInterval(timerRef.current); setMatchStatus('match-lost'); SFX.lose(); });
+    socket.on('opponent-time-up',   ()  => { clearInterval(timerRef.current); setMatchStatus('time-up'); });
     socket.on('opponent-disconnected', () => {
       clearInterval(timerRef.current);
-      showToast('win', 'Opponent disconnected. You win!');
-      setTimeout(() => setMatchStatus('match-won'), 2000);
-      SFX.win();
+      showToast('win','Opponent disconnected. You win!');
+      setTimeout(()=>setMatchStatus('match-won'),2000); SFX.win();
     });
-
     return () => {
-      socket.off('receive-attack');
-      socket.off('opponent-advanced');
-      socket.off('opponent-points-update');
-      socket.off('match-over');
-      socket.off('opponent-time-up');
-      socket.off('opponent-disconnected');
+      socket.off('receive-attack'); socket.off('opponent-advanced'); socket.off('opponent-points-update');
+      socket.off('match-over'); socket.off('opponent-time-up'); socket.off('opponent-disconnected');
     };
   }, [socket, applyTimePenalty, showToast]);
 
-  const handleEditorMount = (editor) => { editorRef.current = editor; };
-
   const sendAttack = (type, cost) => {
-    if (matchStatus !== 'playing' || points < cost) return;
-    const np = points - cost;
-    setPoints(np);
-    socket.emit('send-attack', { type, roomCode });
-    syncState(np, challenge);
+    if (matchStatus!=='playing'||points<cost) return;
+    const np = points-cost; setPoints(np);
+    socket.emit('send-attack',{type,roomCode}); syncState(np,challenge);
   };
 
   const checkSolution = () => {
-    if (!editorRef.current || matchStatus !== 'playing') return;
+    if (!editorRef.current||matchStatus!=='playing') return;
     const code   = editorRef.current.getValue();
     const passed = runTests(code, challenge, language);
-
-    if (!passed) {
-      alert(`❌ Tests failing — keep at it! Check your ${langMeta.label} fix.`);
-      return;
-    }
+    if (!passed) { alert(`❌ Tests failing — check your ${langMeta.label} fix!`); return; }
 
     const gained    = challenge.points;
-    const np        = points + gained;
-    const nextIndex = myRoundIndex + 1;
+    const np        = points+gained;
+    const nextIndex = myRoundIndex+1;
+    const roundMs   = Date.now()-roundStartRef.current;
 
-    setPoints(np);
-    setPointsGain(`+${gained}`);
-    setTimeout(() => setPointsGain(null), 1500);
-    addBonusTime();
-    SFX.solve();
-
-    // Tell server: this player solved and is advancing (include round solve time)
-    const roundMs = Date.now() - roundStartRef.current;
-    socket.emit('round-solved', { roomCode, points: np, newRoundIndex: nextIndex, roundMs });
+    setPoints(np); setPointsGain(`+${gained}`); setTimeout(()=>setPointsGain(null),1500);
+    addBonusTime(); SFX.solve();
+    socket.emit('round-solved', {roomCode, points:np, newRoundIndex:nextIndex, roundMs});
 
     if (np >= WIN_SCORE) {
       clearInterval(timerRef.current);
-      socket.emit('match-won', { roomCode, winnerPoints: np });
-      setMatchStatus('match-won');
-      SFX.win();
-      return;
+      socket.emit('match-won',{roomCode,winnerPoints:np});
+      setMatchStatus('match-won'); SFX.win(); return;
     }
-
     if (nextIndex >= roundSequence.length) {
-      // All rounds done — just keep accumulating points
-      showToast('win', `+${gained}pts! All ${roundSequence.length} rounds complete — hold your lead!`);
-      syncState(np, null);
+      showToast('win',`+${gained}pts! All rounds complete!`); syncState(np,null);
     } else {
-      // Move to next round in the shared sequence
-      const nextRoundData = roundSequence[nextIndex];
-      const nextChallenge = CHALLENGES.find(c => c.id === nextRoundData.challengeId) || CHALLENGES[0];
-      showToast('win', `+${gained}pts! +${BONUS_SECONDS}s → Round ${nextIndex + 1}: ${nextChallenge.title}`);
-      syncState(np, nextChallenge);
-
-      // Advance round after toast
-      setTimeout(() => {
-        setMyRoundIndex(nextIndex);
-        editorKeyRef.current += 1;
-        roundStartRef.current = Date.now(); // reset round timer
-        SFX.roundStart();
-      }, 2000);
+      const nextChallenge = CHALLENGES.find(c=>c.id===roundSequence[nextIndex].challengeId)||CHALLENGES[0];
+      showToast('win',`+${gained}pts! +${BONUS_SECONDS}s → Round ${nextIndex+1}: ${nextChallenge.title}`);
+      syncState(np,nextChallenge);
+      setTimeout(() => { setMyRoundIndex(nextIndex); editorKeyRef.current+=1; roundStartRef.current=Date.now(); SFX.roundStart(); }, 2000);
     }
   };
 
-  const timerDanger  = timeLeft <= 30;
-  const timerWarning = timeLeft > 30 && timeLeft <= 60;
-  const currentVariant = challenge.variants[language] || challenge.variants.javascript;
-  const attackInfo   = ATTACKS.find(a => a.type === attackNotif);
+  const timerDanger  = timeLeft<=30;
+  const timerWarning = timeLeft>30&&timeLeft<=60;
+  const currentVariant = challenge.variants[language]||challenge.variants.javascript;
+  const attackInfo     = ATTACKS.find(a=>a.type===attackNotif);
 
   return (
     <div className={`App ${attack}`}>
+      <OpponentAdvancedPopup data={oppAdvancedData} onDismiss={()=>setOppAdvancedData(null)}/>
 
-      {/* ── BIG OPPONENT ADVANCED POPUP ── */}
-      <OpponentAdvancedPopup data={oppAdvancedData} onDismiss={() => setOppAdvancedData(null)} />
-
-      {/* HEADER */}
       <div className="game-header">
         <div className="game-logo">CODACLUB</div>
         <div className={`timer-display${timerDanger?' danger':timerWarning?' warning':''}${bonusFlash?' bonus-flash':''}${penaltyFlash?' penalty-flash':''}`}>
@@ -723,14 +895,12 @@ function GameScreen({ roomCode, playerName, roundSequence, socket, onPlayAgain }
           {penaltyFlash && <span className="timer-penalty">-{PENALTY_SECONDS}s!</span>}
         </div>
         <div className="game-room-info">
-          ROOM: <span>{roomCode}</span> &nbsp;|&nbsp;
-          {playerName} &nbsp;|&nbsp;
-          You: Rd <span style={{color:'var(--neon-cyan)'}}>{myRoundIndex + 1}</span> &nbsp;|&nbsp;
-          Opp: Rd <span style={{color:'var(--neon-pink)'}}>{opponentRoundIndex + 1}</span>
+          ROOM: <span>{roomCode}</span> &nbsp;|&nbsp; {playerName} &nbsp;|&nbsp;
+          You: Rd <span style={{color:'var(--neon-cyan)'}}>{myRoundIndex+1}</span> &nbsp;|&nbsp;
+          Opp: Rd <span style={{color:'var(--neon-pink)'}}>{opponentRoundIndex+1}</span>
         </div>
       </div>
 
-      {/* SCOREBOARD */}
       <div className="points-bar">
         <div className="score-block">
           <div className="score-name">{playerName} <span style={{color:'var(--neon-cyan)'}}>(YOU)</span></div>
@@ -743,23 +913,15 @@ function GameScreen({ roomCode, playerName, roundSequence, socket, onPlayAgain }
           <div className="score-pts opp">{opponentPoints}<span>pts</span></div>
           <div className="score-bar-wrap"><div className="score-bar-fill" style={{width:`${Math.min((opponentPoints/WIN_SCORE)*100,100)}%`,background:'var(--neon-pink)'}}/></div>
         </div>
-        <div className="win-target">
-          🏁 First to {WIN_SCORE}pts wins<br/>
-          Solve → +{BONUS_SECONDS}s you / −{PENALTY_SECONDS}s them
-        </div>
+        <div className="win-target">🏁 First to {WIN_SCORE}pts wins<br/>Solve → +{BONUS_SECONDS}s you / −{PENALTY_SECONDS}s them</div>
       </div>
 
-      {/* MAIN AREA */}
       <div className="game-main">
         <div className="challenge-panel">
           <div className="challenge-header">
             <span className="challenge-tag">
-              ROUND {myRoundIndex + 1} of {roundSequence.length}
-              {opponentRoundIndex > myRoundIndex && (
-                <span style={{color:'var(--neon-pink)',marginLeft:'12px'}}>
-                  ⚠ Opp is on Rd {opponentRoundIndex + 1}
-                </span>
-              )}
+              ROUND {myRoundIndex+1} of {roundSequence.length}
+              {opponentRoundIndex>myRoundIndex&&<span style={{color:'var(--neon-pink)',marginLeft:'12px'}}>⚠ Opp on Rd {opponentRoundIndex+1}</span>}
             </span>
             <span className="challenge-number">+{challenge.points} pts on solve</span>
           </div>
@@ -770,22 +932,13 @@ function GameScreen({ roomCode, playerName, roundSequence, socket, onPlayAgain }
         <div className="editor-panel">
           <div className="editor-topbar">
             <div className="editor-dots"><span/><span/><span/></div>
-            <div className="language-badge">
-              <span className="language-badge-icon">{langMeta.icon}</span>
-              <span className="language-badge-label">{langMeta.label}</span>
-            </div>
+            <div className="language-badge"><span className="language-badge-icon">{langMeta.icon}</span><span className="language-badge-label">{langMeta.label}</span></div>
             <div className="editor-lang">{langMeta.label}</div>
           </div>
           <div className="editor-wrapper">
-            <Editor
-              key={editorKeyRef.current}
-              height="36vh"
-              theme="vs-dark"
-              language={langMeta.monacoLang}
-              defaultValue={currentVariant?.starterCode || '// no variant found'}
-              onMount={handleEditorMount}
-              options={{ fontSize: 15, minimap: { enabled: false }, fontFamily: "'Share Tech Mono', monospace" }}
-            />
+            <Editor key={editorKeyRef.current} height="36vh" theme="vs-dark" language={langMeta.monacoLang}
+              defaultValue={currentVariant?.starterCode||'// no variant found'} onMount={e=>editorRef.current=e}
+              options={{fontSize:15,minimap:{enabled:false},fontFamily:"'Share Tech Mono',monospace"}}/>
           </div>
         </div>
 
@@ -793,11 +946,9 @@ function GameScreen({ roomCode, playerName, roundSequence, socket, onPlayAgain }
           <div className="attacks-panel">
             <div className="attacks-title">⚡ ATTACKS</div>
             <div className="attacks-grid">
-              {ATTACKS.map(atk => (
-                <button key={atk.type}
-                  className={`attack-btn ${points < atk.cost ? 'cant-afford' : ''}`}
-                  onClick={() => sendAttack(atk.type, atk.cost)}
-                  disabled={matchStatus !== 'playing' || points < atk.cost}>
+              {ATTACKS.map(atk=>(
+                <button key={atk.type} className={`attack-btn ${points<atk.cost?'cant-afford':''}`}
+                  onClick={()=>sendAttack(atk.type,atk.cost)} disabled={matchStatus!=='playing'||points<atk.cost}>
                   <span className="attack-icon">{atk.icon}</span>
                   <span className="attack-name">{atk.name}</span>
                   <span className="attack-cost">{atk.cost}pts</span>
@@ -806,76 +957,59 @@ function GameScreen({ roomCode, playerName, roundSequence, socket, onPlayAgain }
             </div>
           </div>
           <div className="submit-panel">
-            <button className="btn-submit" onClick={checkSolution} disabled={matchStatus !== 'playing'}>SUBMIT ✓</button>
-            <div className={`status-text ${attack ? 'under-attack' : ''}`}>
-              {attack ? `⚠ ${attack.replace('-mode','').toUpperCase()} ATTACK!` : '● solving...'}
-            </div>
+            <button className="btn-submit" onClick={checkSolution} disabled={matchStatus!=='playing'}>SUBMIT ✓</button>
+            <div className={`status-text ${attack?'under-attack':''}`}>{attack?`⚠ ${attack.replace('-mode','').toUpperCase()} ATTACK!`:'● solving...'}</div>
           </div>
         </div>
       </div>
 
-      {/* TOAST */}
       {toast && (
         <div className={`round-toast ${toast.type}`}>
-          <div className="round-toast-icon">{toast.type === 'win' ? '✅' : '💀'}</div>
-          <div>
-            <div className="round-toast-title">{toast.type === 'win' ? 'ROUND SOLVED!' : 'NOTICE'}</div>
-            <div className="round-toast-sub">{toast.message}</div>
-          </div>
+          <div className="round-toast-icon">{toast.type==='win'?'✅':'💀'}</div>
+          <div><div className="round-toast-title">{toast.type==='win'?'ROUND SOLVED!':'NOTICE'}</div><div className="round-toast-sub">{toast.message}</div></div>
         </div>
       )}
-
-      {/* ATTACK NOTIFICATION */}
       {attackNotif && (
         <div className="attack-notification">
-          <span className="attack-notification-icon">{attackInfo?.icon || '⚡'}</span>
+          <span className="attack-notification-icon">{attackInfo?.icon||'⚡'}</span>
           <span className="attack-notification-text">{attackNotif.replace('-mode','').toUpperCase()} ATTACK!</span>
         </div>
       )}
-
-      {/* POINTS GAIN */}
       {pointsGain && <div className="points-gained">{pointsGain}</div>}
 
-      {/* END SCREENS */}
-      {matchStatus === 'match-won' && (
+      {matchStatus==='match-won' && (
         <div className="overlay win">
-          {showLeaderboard && <Leaderboard socket={socket} onClose={() => setShowLeaderboard(false)} highlightName={playerName} />}
+          {showLeaderboard && <Leaderboard socket={socket} onClose={()=>setShowLeaderboard(false)} highlightName={playerName}/>}
           <div className="overlay-title">CHAMPION!</div>
           <div className="overlay-sub">you reached {WIN_SCORE} points first</div>
           <div className="overlay-score">🏆 {points} pts</div>
           <div className="overlay-btn-row">
             <button className="btn-play-again" onClick={onPlayAgain}>PLAY AGAIN</button>
-            <button className="btn-lb-end" onClick={() => setShowLeaderboard(true)}>🏆 LEADERBOARD</button>
+            <button className="btn-lb-end" onClick={()=>setShowLeaderboard(true)}>🏆 LEADERBOARD</button>
           </div>
         </div>
       )}
-      {matchStatus === 'match-lost' && (
+      {matchStatus==='match-lost' && (
         <div className="overlay lose">
-          {showLeaderboard && <Leaderboard socket={socket} onClose={() => setShowLeaderboard(false)} highlightName={playerName} />}
+          {showLeaderboard && <Leaderboard socket={socket} onClose={()=>setShowLeaderboard(false)} highlightName={playerName}/>}
           <div className="overlay-title">DEFEATED</div>
           <div className="overlay-sub">opponent reached {WIN_SCORE} points first</div>
           <div className="overlay-score">💀 {points} pts</div>
           <div className="overlay-btn-row">
             <button className="btn-play-again" onClick={onPlayAgain}>REMATCH</button>
-            <button className="btn-lb-end" onClick={() => setShowLeaderboard(true)}>🏆 LEADERBOARD</button>
+            <button className="btn-lb-end" onClick={()=>setShowLeaderboard(true)}>🏆 LEADERBOARD</button>
           </div>
         </div>
       )}
-      {matchStatus === 'time-up' && (
-        <div className={`overlay ${points >= opponentPoints ? 'win' : 'lose'}`}>
-          {showLeaderboard && <Leaderboard socket={socket} onClose={() => setShowLeaderboard(false)} highlightName={playerName} />}
-          <div className="overlay-title">
-            {points > opponentPoints ? 'TIME WINNER!' : points === opponentPoints ? "DRAW!" : 'TIME UP!'}
-          </div>
-          <div className="overlay-sub">
-            {points > opponentPoints ? 'More points when time expired!'
-              : points === opponentPoints ? 'Tied on points!'
-              : 'Opponent had more points!'}
-          </div>
+      {matchStatus==='time-up' && (
+        <div className={`overlay ${points>=opponentPoints?'win':'lose'}`}>
+          {showLeaderboard && <Leaderboard socket={socket} onClose={()=>setShowLeaderboard(false)} highlightName={playerName}/>}
+          <div className="overlay-title">{points>opponentPoints?'TIME WINNER!':points===opponentPoints?'DRAW!':'TIME UP!'}</div>
+          <div className="overlay-sub">{points>opponentPoints?'More points when time expired!':points===opponentPoints?'Tied on points!':'Opponent had more points!'}</div>
           <div className="overlay-score">You: {points}pts | Opponent: {opponentPoints}pts</div>
           <div className="overlay-btn-row">
             <button className="btn-play-again" onClick={onPlayAgain}>PLAY AGAIN</button>
-            <button className="btn-lb-end" onClick={() => setShowLeaderboard(true)}>🏆 LEADERBOARD</button>
+            <button className="btn-lb-end" onClick={()=>setShowLeaderboard(true)}>🏆 LEADERBOARD</button>
           </div>
         </div>
       )}
@@ -883,9 +1017,9 @@ function GameScreen({ roomCode, playerName, roundSequence, socket, onPlayAgain }
   );
 }
 
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════
 // ROOT
-// ─────────────────────────────────────────────
+// ══════════════════════════════════════════════
 const getSocket = (() => {
   let s = null;
   return () => {
@@ -897,6 +1031,9 @@ const getSocket = (() => {
 })();
 
 function App() {
+  const [authUser,      setAuthUser]      = useState(null);  // null=loading, {isGuest,username,user}
+  const [needsUsername, setNeedsUsername] = useState(false);
+  const [supaUser,      setSupaUser]      = useState(null);
   const [screen,        setScreen]        = useState('lobby');
   const [roomCode,      setRoomCode]      = useState('');
   const [playerName,    setPlayerName]    = useState('');
@@ -904,22 +1041,92 @@ function App() {
   const [spectatorData, setSpectatorData] = useState(null);
   const sock = getSocket();
 
+  // Check Supabase session on load
+  useEffect(() => {
+    const checkSession = async () => {
+      const { data: { session } } = await supabase.auth.getSession();
+      if (session?.user) {
+        await resolveUser(session.user);
+      } else {
+        setAuthUser(null); // show auth screen
+      }
+    };
+    checkSession();
+
+    const { data: { subscription } } = supabase.auth.onAuthStateChange(async (_event, session) => {
+      if (session?.user) {
+        await resolveUser(session.user);
+      } else {
+        setAuthUser(null);
+      }
+    });
+    return () => subscription.unsubscribe();
+  // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, []);
+
+  const resolveUser = async (user) => {
+    setSupaUser(user);
+    // Check if they have a profile (username set)
+    const { data: profile } = await supabase
+      .from('profiles').select('username').eq('user_id', user.id).single();
+    if (profile?.username) {
+      setAuthUser({ isGuest: false, username: profile.username, user });
+      setNeedsUsername(false);
+    } else {
+      // First login — need to pick username
+      setNeedsUsername(true);
+      setAuthUser(null);
+    }
+  };
+
+  const handleUsernameComplete = (username) => {
+    setNeedsUsername(false);
+    setAuthUser({ isGuest: false, username, user: supaUser });
+  };
+
+  const handleAuth = (authData) => setAuthUser(authData);
+
+  const handleSignOut = async () => {
+    await supabase.auth.signOut();
+    setAuthUser(null); setScreen('lobby');
+  };
+
   const handleJoinGame = (code, name, seq) => {
     setRoomCode(code); setPlayerName(name); setRoundSequence(seq); setScreen('game');
   };
+
   const handleSpectate = (code, playerNames, gameState) => {
-    setRoomCode(code); setSpectatorData({ playerNames, gameState }); setScreen('spectate');
+    setRoomCode(code); setSpectatorData({playerNames,gameState}); setScreen('spectate');
   };
 
-  if (screen === 'spectate' && spectatorData) {
-    return <SpectatorScreen roomCode={roomCode} playerNames={spectatorData.playerNames}
-      initialGameState={spectatorData.gameState} socket={sock} onLeave={() => setScreen('lobby')} />;
+  // Loading state
+  if (authUser === undefined) {
+    return <div style={{background:'#050810',height:'100vh',display:'flex',alignItems:'center',justifyContent:'center',color:'var(--neon-cyan)',fontFamily:'Orbitron',letterSpacing:'.2em'}}>LOADING...</div>;
   }
 
-  return screen === 'lobby'
-    ? <LobbyScreen onJoinGame={handleJoinGame} onSpectate={handleSpectate} socket={sock} />
-    : <GameScreen roomCode={roomCode} playerName={playerName} roundSequence={roundSequence}
-        socket={sock} onPlayAgain={() => setScreen('lobby')} />;
+  // Username setup for first-time Google users
+  if (needsUsername && supaUser) {
+    return <UsernameSetupScreen user={supaUser} onComplete={handleUsernameComplete}/>;
+  }
+
+  // Not authed yet — show auth screen
+  if (!authUser) return <AuthScreen onAuth={handleAuth}/>;
+
+  // Spectator
+  if (screen==='spectate' && spectatorData) {
+    return <SpectatorScreen roomCode={roomCode} playerNames={spectatorData.playerNames}
+      initialGameState={spectatorData.gameState} socket={sock} onLeave={()=>setScreen('lobby')}/>;
+  }
+
+  // Game
+  if (screen==='game') {
+    return <GameScreen roomCode={roomCode} playerName={playerName} roundSequence={roundSequence}
+      socket={sock} onPlayAgain={()=>setScreen('lobby')}/>;
+  }
+
+  // Lobby
+  return <LobbyScreen authUser={authUser} onJoinGame={handleJoinGame} onSpectate={handleSpectate}
+    onSignOut={handleSignOut} socket={sock}/>;
 }
 
 export default App;
